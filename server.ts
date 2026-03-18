@@ -1,3 +1,13 @@
+import { createRequire } from "module";
+
+// Polyfill Node 20's removed util.isNullOrUndefined before any other module loads.
+// Some TensorFlow-related dependencies still call util.isNullOrUndefined.
+const require = createRequire(import.meta.url);
+const util = require("util");
+if (typeof (util as any).isNullOrUndefined !== "function") {
+  (util as any).isNullOrUndefined = (v: any) => v === null || v === undefined;
+}
+
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
@@ -9,7 +19,8 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import Anthropic from "@anthropic-ai/sdk";
-import { isInland as isInlandGSHHG, distanceToCoastKm } from "./lib/gshhg-landmask.js";
+import { isInland as isInlandGSHHG, distanceToCoastKm } from "./lib/gshhg-landmask";
+import { embedTexts, cosineSimilarity, serializeEmbedding, parseEmbedding } from "./lib/semanticDedup";
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
@@ -56,6 +67,8 @@ db.exec(`
     image_url TEXT,
     start_date TEXT,
     end_date TEXT,
+    title_embedding TEXT,
+    description_embedding TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -124,11 +137,19 @@ db.exec(`
 
 try {
   db.exec(`ALTER TABLE telemetry ADD COLUMN raw_response TEXT`);
-} catch (e) {}
+} catch (e) { }
 
 try {
   db.exec(`ALTER TABLE projects ADD COLUMN s_ocean_score REAL`);
-} catch (e) {}
+} catch (e) { }
+
+try {
+  db.exec(`ALTER TABLE projects ADD COLUMN title_embedding TEXT`);
+} catch (e) { }
+
+try {
+  db.exec(`ALTER TABLE projects ADD COLUMN description_embedding TEXT`);
+} catch (e) { }
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS failed_extractions (
@@ -284,7 +305,7 @@ async function runExtractOnly(projectUrl: string, taskConfig?: TaskConfig): Prom
     }
     const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
     broadcastLog({ key: "etl_claude_extract", title: (projectData.title || "?").slice(0, 40) });
-    const upsertResult = upsertProject({
+    const upsertResult = await upsertProject({
       title: projectData.title || "Unknown",
       url: projectData.url || projectUrl,
       description: projectData.description || "",
@@ -355,10 +376,12 @@ function normalizeText(s: string): string {
 }
 
 function textSimilarity(a: string, b: string, maxLen?: number): number {
+  // Fallback similarity: token-based Jaccard. Used when embeddings are not available.
   const na = normalizeText(a);
   const nb = normalizeText(b);
   if (!na || !nb) return na === nb ? 1 : 0;
-  let sa = na, sb = nb;
+  let sa = na,
+    sb = nb;
   if (maxLen) {
     sa = sa.slice(0, maxLen);
     sb = sb.slice(0, maxLen);
@@ -369,6 +392,91 @@ function textSimilarity(a: string, b: string, maxLen?: number): number {
   const inter = [...wa].filter((w) => wb.has(w)).length;
   const union = wa.size + wb.size - inter;
   return union > 0 ? inter / union : 0;
+}
+
+async function computeEmbeddingsForProject(project: {
+  title: string;
+  description?: string;
+}): Promise<{ titleEmbedding: number[]; descriptionEmbedding: number[] | null }> {
+  const title = normalizeText(project.title);
+  const description = project.description ? normalizeText(project.description) : "";
+  const texts = [title];
+  if (description) texts.push(description);
+  const embeddings = await embedTexts(texts);
+  return {
+    titleEmbedding: embeddings[0] ?? [],
+    descriptionEmbedding: description ? embeddings[1] ?? null : null,
+  };
+}
+
+const updateEmbeddingsStmt = db.prepare(`
+  UPDATE projects SET title_embedding = ?, description_embedding = ? WHERE id = ?
+`);
+
+async function findDuplicateProject(project: {
+  title: string;
+  description: string;
+  lat: number;
+  lng: number;
+  title_embedding?: number[];
+  description_embedding?: number[] | null;
+}): Promise<{ id: number; url: string } | null> {
+  const { title, description, lat, lng } = project;
+  const { titleEmbedding, descriptionEmbedding } =
+    project.title_embedding && project.description_embedding !== undefined
+      ? {
+        titleEmbedding: project.title_embedding,
+        descriptionEmbedding: project.description_embedding ?? null,
+      }
+      : await computeEmbeddingsForProject({ title, description });
+
+  const delta = 0.02; // ~2km bounding box
+  const rows = selectCandidatesByCoords.all(
+    lat - delta,
+    lat + delta,
+    lng - delta,
+    lng + delta
+  ) as { id: number; title: string; url: string; description: string; lat: number; lng: number; title_embedding?: string; description_embedding?: string }[];
+
+  for (const row of rows) {
+    const dist = haversineDistanceKm(lat, lng, row.lat, row.lng);
+    if (dist > DEDUP_COORD_KM) continue;
+
+    let candidateTitleEmb = parseEmbedding(row.title_embedding);
+    let candidateDescEmb = parseEmbedding(row.description_embedding);
+
+    // If the row lacks embeddings, compute and persist them for future runs.
+    if (!candidateTitleEmb || (row.description && !candidateDescEmb)) {
+      const { titleEmbedding: computedTitleEmb, descriptionEmbedding: computedDescEmb } =
+        await computeEmbeddingsForProject({ title: row.title, description: row.description || "" });
+      candidateTitleEmb = candidateTitleEmb || computedTitleEmb;
+      candidateDescEmb = candidateDescEmb || computedDescEmb;
+      try {
+        updateEmbeddingsStmt.run(serializeEmbedding(candidateTitleEmb), serializeEmbedding(candidateDescEmb), row.id);
+      } catch (e) {
+        // ignore write failures
+      }
+    }
+
+    const titleSim = cosineSimilarity(titleEmbedding, candidateTitleEmb);
+    const hasDescriptionComparison = descriptionEmbedding && candidateDescEmb;
+    const descSim = hasDescriptionComparison ? cosineSimilarity(descriptionEmbedding, candidateDescEmb) : 1;
+
+    if (titleSim >= DEDUP_TITLE_SIMILARITY && descSim >= DEDUP_DESC_SIMILARITY) {
+      return { id: row.id, url: row.url };
+    }
+
+    // Fallback to token-level similarity when embeddings are unavailable
+    if ((!titleEmbedding.length || !candidateTitleEmb?.length) && (titleSim >= DEDUP_TITLE_SIMILARITY)) {
+      const fallbackTitleSim = textSimilarity(title, row.title);
+      const fallbackDescSim = textSimilarity(description, row.description || "", 200);
+      if (fallbackTitleSim >= DEDUP_TITLE_SIMILARITY && fallbackDescSim >= DEDUP_DESC_SIMILARITY) {
+        return { id: row.id, url: row.url };
+      }
+    }
+  }
+
+  return null;
 }
 
 function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -383,42 +491,22 @@ function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: num
 }
 
 const selectCandidatesByCoords = db.prepare(`
-  SELECT id, title, url, description, lat, lng FROM projects
+  SELECT id, title, url, description, lat, lng, title_embedding, description_embedding FROM projects
   WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
 `);
-
-function findDuplicateProject(project: { title: string; description: string; lat: number; lng: number }): { id: number; url: string } | null {
-  const { title, description, lat, lng } = project;
-  const delta = 0.02; // ~2km bounding box
-  const rows = selectCandidatesByCoords.all(
-    lat - delta,
-    lat + delta,
-    lng - delta,
-    lng + delta
-  ) as { id: number; title: string; url: string; description: string; lat: number; lng: number }[];
-  for (const row of rows) {
-    const dist = haversineDistanceKm(lat, lng, row.lat, row.lng);
-    if (dist > DEDUP_COORD_KM) continue;
-    const tSim = textSimilarity(title, row.title);
-    const dSim = textSimilarity(description, row.description, 200);
-    if (tSim >= DEDUP_TITLE_SIMILARITY && dSim >= DEDUP_DESC_SIMILARITY) {
-      return { id: row.id, url: row.url };
-    }
-  }
-  return null;
-}
 
 const updateProjectByIdStmt = db.prepare(`
   UPDATE projects SET
     title = ?, description = ?, funder = ?, lat = ?, lng = ?,
     category = ?, status = ?, image_url = ?, start_date = ?, end_date = ?,
-    relevance_score = ?, s_ocean_score = ?
+    relevance_score = ?, s_ocean_score = ?,
+    title_embedding = ?, description_embedding = ?
   WHERE id = ?
 `);
 
 const insertProjectStmt = db.prepare(`
-  INSERT INTO projects (title, url, description, funder, lat, lng, category, status, relevance_score, image_url, start_date, end_date, s_ocean_score)
-  VALUES (@title, @url, @description, @funder, @lat, @lng, @category, @status, @relevance_score, @image_url, @start_date, @end_date, @s_ocean_score)
+  INSERT INTO projects (title, url, description, funder, lat, lng, category, status, relevance_score, image_url, start_date, end_date, s_ocean_score, title_embedding, description_embedding)
+  VALUES (@title, @url, @description, @funder, @lat, @lng, @category, @status, @relevance_score, @image_url, @start_date, @end_date, @s_ocean_score, @title_embedding, @description_embedding)
   ON CONFLICT(url) DO UPDATE SET
     title = excluded.title,
     description = excluded.description,
@@ -431,7 +519,9 @@ const insertProjectStmt = db.prepare(`
     start_date = excluded.start_date,
     end_date = excluded.end_date,
     relevance_score = excluded.relevance_score,
-    s_ocean_score = excluded.s_ocean_score
+    s_ocean_score = excluded.s_ocean_score,
+    title_embedding = excluded.title_embedding,
+    description_embedding = excluded.description_embedding
 `);
 
 type ProjectRow = {
@@ -448,9 +538,21 @@ type ProjectRow = {
   end_date?: string | null;
   relevance_score?: number;
   s_ocean_score?: number;
+  title_embedding?: number[];
+  description_embedding?: number[] | null;
 };
 
-function upsertProject(p: ProjectRow): "inserted" | "updated" | "skipped" {
+function chooseBestValue(existing: any, incoming: any): any {
+  if (incoming === undefined || incoming === null || incoming === "") return existing;
+  if (existing === undefined || existing === null || existing === "") return incoming;
+  if (typeof existing === "string" && typeof incoming === "string") {
+    // Prefer longer text (more complete) when there is a difference
+    return incoming.length > existing.length ? incoming : existing;
+  }
+  return incoming;
+}
+
+async function upsertProject(p: ProjectRow): Promise<"inserted" | "updated" | "skipped"> {
   if (swarmStopped) return "skipped"; // Stop all inserts when swarm is stopped
   if (!p || !p.title || p.lat === undefined || p.lng === undefined) return "skipped";
   const lat = parseFloat(String(p.lat));
@@ -462,15 +564,20 @@ function upsertProject(p: ProjectRow): "inserted" | "updated" | "skipped" {
   const funder = Array.isArray(p.funder) ? p.funder.join(", ") : (p.funder || "");
   const projectUrl = p.url || `internal://${title.replace(/[^\w]/g, "-").toLowerCase()}-${lat}-${lng}`;
 
-  const existingByUrl = db.prepare("SELECT id FROM projects WHERE url = ?").get(projectUrl) as { id: number } | undefined;
-  if (existingByUrl) {
-    const existing = db.prepare("SELECT funder FROM projects WHERE id = ?").get(existingByUrl.id) as { funder: string } | undefined;
-    const mergedFunder = existing?.funder
-      ? [...new Set([...existing.funder.split(",").map((f) => f.trim()).filter(Boolean), ...funder.split(",").map((f) => f.trim()).filter(Boolean)])].join(", ")
-      : funder;
+  const { titleEmbedding, descriptionEmbedding } = await computeEmbeddingsForProject({ title, description });
+
+  const existingByUrl = db.prepare("SELECT id, title, description, funder FROM projects WHERE url = ?").get(projectUrl) as
+    | { id: number; title: string; description: string; funder: string }
+    | undefined;
+
+  const mergedFunder = (existingByUrl?.funder || "")
+    ? [...new Set([...(existingByUrl?.funder || "").split(",").map((f) => f.trim()).filter(Boolean), ...funder.split(",").map((f) => f.trim()).filter(Boolean)])].join(", ")
+    : funder;
+
+  const applyUpdate = (id: number, existing: any) => {
     updateProjectByIdStmt.run(
-      title,
-      description,
+      chooseBestValue(existing.title, title),
+      chooseBestValue(existing.description, description),
       mergedFunder,
       lat,
       lng,
@@ -481,32 +588,30 @@ function upsertProject(p: ProjectRow): "inserted" | "updated" | "skipped" {
       p.end_date ?? null,
       p.relevance_score ?? 0.95,
       p.s_ocean_score ?? 0.75,
-      existingByUrl.id
+      serializeEmbedding(titleEmbedding),
+      serializeEmbedding(descriptionEmbedding),
+      id
     );
+  };
+
+  if (existingByUrl) {
+    applyUpdate(existingByUrl.id, existingByUrl);
     return "updated";
   }
 
-  const dup = findDuplicateProject({ title, description, lat, lng });
+  const dup = await findDuplicateProject({
+    title,
+    description,
+    lat,
+    lng,
+    title_embedding: titleEmbedding,
+    description_embedding: descriptionEmbedding,
+  });
   if (dup) {
-    const existing = db.prepare("SELECT funder FROM projects WHERE id = ?").get(dup.id) as { funder: string } | undefined;
-    const mergedFunder = existing?.funder
-      ? [...new Set([...existing.funder.split(",").map((f) => f.trim()).filter(Boolean), ...funder.split(",").map((f) => f.trim()).filter(Boolean)])].join(", ")
-      : funder;
-    updateProjectByIdStmt.run(
-      title,
-      description,
-      mergedFunder,
-      lat,
-      lng,
-      p.category || "General",
-      p.status || "Active",
-      p.image_url ?? null,
-      p.start_date ?? null,
-      p.end_date ?? null,
-      p.relevance_score ?? 0.95,
-      p.s_ocean_score ?? 0.75,
-      dup.id
-    );
+    const existing = db.prepare("SELECT title, description, funder FROM projects WHERE id = ?").get(dup.id) as
+      | { title: string; description: string; funder: string }
+      | undefined;
+    applyUpdate(dup.id, existing || {});
     return "updated";
   }
 
@@ -524,29 +629,44 @@ function upsertProject(p: ProjectRow): "inserted" | "updated" | "skipped" {
     end_date: p.end_date ?? null,
     relevance_score: p.relevance_score ?? 0.95,
     s_ocean_score: p.s_ocean_score ?? 0.75,
+    title_embedding: serializeEmbedding(titleEmbedding),
+    description_embedding: serializeEmbedding(descriptionEmbedding),
   });
   const row = db.prepare("SELECT id FROM projects WHERE url = ?").get(projectUrl) as { id: number } | undefined;
   const feature = {
     type: "Feature",
     geometry: { type: "Point", coordinates: [lng, lat] },
-    properties: { id: row?.id, title, url: projectUrl, description, funder, relevance_score: p.relevance_score ?? 0.95, s_ocean_score: p.s_ocean_score ?? 0.75, category: p.category, status: p.status, image_url: p.image_url, start_date: p.start_date, end_date: p.end_date }
+    properties: {
+      id: row?.id,
+      title,
+      url: projectUrl,
+      description,
+      funder,
+      relevance_score: p.relevance_score ?? 0.95,
+      s_ocean_score: p.s_ocean_score ?? 0.75,
+      category: p.category,
+      status: p.status,
+      image_url: p.image_url,
+      start_date: p.start_date,
+      end_date: p.end_date,
+    },
   };
   broadcastNewProject(feature);
   return "inserted";
 }
 
-const insertManyProjects = db.transaction((projects: any[]) => {
+async function insertManyProjects(projects: any[]): Promise<number> {
   let count = 0;
   for (const p of projects) {
-    const result = upsertProject(p);
+    const result = await upsertProject(p);
     if (result !== "skipped") count++;
   }
   return count;
-});
+}
 
-function saveProjects(projects: any[]) {
+async function saveProjects(projects: any[]): Promise<number> {
   console.log(`[Database] saveProjects called with ${projects.length} items`);
-  const savedCount = insertManyProjects(projects);
+  const savedCount = await insertManyProjects(projects);
   console.log(`[Database] Saved ${savedCount} projects to database`);
   return savedCount;
 }
@@ -561,7 +681,7 @@ function recordTelemetry(engine: string, targetUrl: string, status: string, proj
 function parseProjectsData(projectsData: any) {
   console.log(`[Parser] Parsing data of type: ${typeof projectsData}`);
   let projects = projectsData;
-  
+
   // If it's a string, try to parse it as JSON first
   if (typeof projects === 'string') {
     try {
@@ -573,7 +693,7 @@ function parseProjectsData(projectsData: any) {
       // Not a valid JSON object string, continue
     }
   }
-  
+
   // Extract string from result/output wrapper if present
   if (typeof projects === 'object' && projects !== null && !Array.isArray(projects)) {
     if (typeof projects.result === 'string') {
@@ -588,7 +708,7 @@ function parseProjectsData(projectsData: any) {
       // Try to find JSON block
       const jsonMatch = projects.match(/```json\s*([\s\S]*?)\s*```/) || projects.match(/```\s*([\s\S]*?)\s*```/);
       const cleaned = jsonMatch ? jsonMatch[1] : projects.trim();
-      
+
       // Remove any leading/trailing non-JSON characters if no block found
       let jsonStr = cleaned;
       if (!jsonMatch) {
@@ -596,14 +716,14 @@ function parseProjectsData(projectsData: any) {
         const end = cleaned.lastIndexOf(']');
         const startObj = cleaned.indexOf('{');
         const endObj = cleaned.lastIndexOf('}');
-        
+
         if (start !== -1 && end !== -1 && (start < startObj || startObj === -1)) {
           jsonStr = cleaned.substring(start, end + 1);
         } else if (startObj !== -1 && endObj !== -1) {
           jsonStr = cleaned.substring(startObj, endObj + 1);
         }
       }
-      
+
       console.log(`[Parser] Attempting to parse JSON string: ${jsonStr.substring(0, 100)}...`);
       projects = JSON.parse(jsonStr);
     } catch (e) {
@@ -615,18 +735,18 @@ function parseProjectsData(projectsData: any) {
   if (!Array.isArray(projects) && projects !== null && typeof projects === 'object') {
     console.log(`[Parser] Data is object, extracting array. Keys: ${Object.keys(projects).join(', ')}`);
     if (projects.type === "FeatureCollection" && Array.isArray(projects.features)) {
-       projects = projects.features;
+      projects = projects.features;
     } else if (projects.projects && Array.isArray(projects.projects)) {
       projects = projects.projects;
     } else if (projects.result && Array.isArray(projects.result)) {
       projects = projects.result;
     } else if (projects.features && Array.isArray(projects.features)) {
-       projects = projects.features;
+      projects = projects.features;
     } else {
       projects = [projects];
     }
   }
-  
+
   if (!Array.isArray(projects)) {
     console.warn("[Parser] Could not find array in data");
     return [];
@@ -643,11 +763,11 @@ function parseProjectsData(projectsData: any) {
         lng: p.geometry.coordinates?.[0]
       };
     }
-    
+
     // Normalize lat/lng keys
     if (normalized.latitude !== undefined && normalized.lat === undefined) normalized.lat = normalized.latitude;
     if (normalized.longitude !== undefined && normalized.lng === undefined) normalized.lng = normalized.longitude;
-    
+
     return normalized;
   });
 }
@@ -696,11 +816,11 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     html = await res.text();
-    
+
     const doc = new JSDOM(html, { url });
     const reader = new Readability(doc.window.document);
     const article = reader.parse();
-    
+
     if (article && article.textContent.length > 500) {
       const markdown = turndownService.turndown(article.content);
       const imageUrls = extractImageUrlsFromHtml(html, url);
@@ -710,7 +830,7 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
     }
   } catch (err: any) {
     console.log(`[Web Reading] Readability failed for ${url} (${err.message}), switching to Mdream...`);
-    
+
     try {
       // Niveau 2: Mdream
       if (html) {
@@ -816,8 +936,8 @@ function passesMarineGatekeeper(
       pass: false,
       reason: inland
         ? (coastKm > 0
-            ? `Gatekeeper: projet à >${coastKm} km de la côte (${lat.toFixed(2)}, ${lng.toFixed(2)}), marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`
-            : `Gatekeeper: projet situé en terres (${lat.toFixed(2)}, ${lng.toFixed(2)}), marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`)
+          ? `Gatekeeper: projet à >${coastKm} km de la côte (${lat.toFixed(2)}, ${lng.toFixed(2)}), marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`
+          : `Gatekeeper: projet situé en terres (${lat.toFixed(2)}, ${lng.toFixed(2)}), marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`)
         : `Gatekeeper: marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`,
     };
   }
@@ -964,16 +1084,16 @@ async function extractProjectData(markdown: string, url: string, extractionConfi
 function parseUrlsData(projectsData: any): string[] {
   console.log(`[Parser] Parsing URLs data of type: ${typeof projectsData}`);
   let projects = projectsData;
-  
+
   if (typeof projects === 'string') {
     try {
       const parsed = JSON.parse(projects);
       if (typeof parsed === 'object' && parsed !== null) {
         projects = parsed;
       }
-    } catch (e) {}
+    } catch (e) { }
   }
-  
+
   if (typeof projects === 'object' && projects !== null && !Array.isArray(projects)) {
     if (typeof projects.result === 'string') projects = projects.result;
     else if (typeof projects.output === 'string') projects = projects.output;
@@ -983,7 +1103,7 @@ function parseUrlsData(projectsData: any): string[] {
     try {
       const jsonMatch = projects.match(/```json\s*([\s\S]*?)\s*```/) || projects.match(/```\s*([\s\S]*?)\s*```/);
       const cleaned = jsonMatch ? jsonMatch[1] : projects.trim();
-      
+
       let jsonStr = cleaned;
       if (!jsonMatch) {
         const start = cleaned.indexOf('[');
@@ -992,7 +1112,7 @@ function parseUrlsData(projectsData: any): string[] {
           jsonStr = cleaned.substring(start, end + 1);
         }
       }
-      
+
       projects = JSON.parse(jsonStr);
     } catch (e) {
       console.error("Failed to parse string result:", typeof projects === 'string' ? projects.substring(0, 200) : projects);
@@ -1005,9 +1125,9 @@ function parseUrlsData(projectsData: any): string[] {
     else if (projects.result && Array.isArray(projects.result)) projects = projects.result;
     else projects = [projects];
   }
-  
+
   if (!Array.isArray(projects)) return [];
-  
+
   return projects.filter(p => typeof p === 'string');
 }
 
@@ -1030,10 +1150,10 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
       body: JSON.stringify({
         url: targetUrl,
         goal: mode === 'extract' ? EXTRACT_PROMPT : GOAL_PROMPT,
-        max_steps: 60 
+        max_steps: 60
       }),
     });
-    
+
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`[TinyFish] API Error Response (${response.status}):`, errorText);
@@ -1046,7 +1166,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     if (process.env.DEBUG_TINYFISH) {
       console.log(`[TinyFish] Initial Run Data:`, JSON.stringify(safeRunData));
     }
-    
+
     if ((!runData.id && !runData.run_id) || (runData.error && runData.error !== null)) {
       console.error(`[TinyFish] Failed to start run for ${targetUrl}. Full Response:`, JSON.stringify(runData));
       const errorMsg = typeof runData.error === 'object' ? JSON.stringify(runData.error) : runData.error;
@@ -1054,10 +1174,10 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     }
     runId = runData.id || runData.run_id;
     const streamingUrl = runData.streamingUrl || runData.streaming_url;
-    
+
     console.log(`[TinyFish] Run started: ${runId} for ${targetUrl}. Status: ${runData.status || 'UNKNOWN'}`);
     if (runData.error) console.log(`[TinyFish] Note: Run started with non-fatal error key: ${runData.error}`);
-    
+
     if (swarmStopped) return 0; // Don't increment or register if we stopped
     agentCounter++;
     const label = `TinyFish ${agentCounter}`;
@@ -1072,7 +1192,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     let pendingStartTime = Date.now();
     const PENDING_TIMEOUT_MS = 120000; // 2 minutes: free slot if TinyFish never starts
     let lastPendingLog = 0;
-    
+
     while (status === "RUNNING" || status === "PENDING") {
       // Check if run was aborted
       const currentRun = activeRuns.get(runId);
@@ -1084,14 +1204,14 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
       // Safety timeout for PENDING state
       const timeInPending = Date.now() - pendingStartTime;
       if (status === "PENDING" && (timeInPending > PENDING_TIMEOUT_MS)) {
-        console.error(`[TinyFish] Run ${runId} timed out in PENDING state after ${Math.round(timeInPending/1000)}s. Freeing slot.`);
+        console.error(`[TinyFish] Run ${runId} timed out in PENDING state after ${Math.round(timeInPending / 1000)}s. Freeing slot.`);
         activeRuns.delete(runId);
         throw new Error("Agent timed out while waiting to start (PENDING state too long). Slot freed for next task.");
       }
       // Log PENDING at most every 30s to avoid spam
       if (status === "PENDING" && (Date.now() - lastPendingLog > 30000)) {
         lastPendingLog = Date.now();
-        console.log(`[TinyFish] Run ${runId} still PENDING (${Math.round(timeInPending/1000)}s). Timeout in ${Math.round((PENDING_TIMEOUT_MS - timeInPending)/1000)}s.`);
+        console.log(`[TinyFish] Run ${runId} still PENDING (${Math.round(timeInPending / 1000)}s). Timeout in ${Math.round((PENDING_TIMEOUT_MS - timeInPending) / 1000)}s.`);
       }
 
       await new Promise(resolve => setTimeout(resolve, 5000));
@@ -1099,30 +1219,30 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
         const statusRes = await fetch(`https://agent.tinyfish.ai/v1/runs/${runId}`, {
           headers: { "X-API-Key": apiKey }
         });
-        
+
         if (!statusRes.ok) {
-           console.error(`[TinyFish] Failed to fetch status for run ${runId}. Status: ${statusRes.status}`);
-           continue; // Try again next loop
+          console.error(`[TinyFish] Failed to fetch status for run ${runId}. Status: ${statusRes.status}`);
+          continue; // Try again next loop
         }
 
         const statusData = await statusRes.json();
         status = statusData.status;
-        
+
         // Update streaming URL if it was missing and is now available
         if (currentRun && !currentRun.streamingUrl && (statusData.streamingUrl || statusData.streaming_url)) {
-          activeRuns.set(runId, { 
-            ...currentRun, 
+          activeRuns.set(runId, {
+            ...currentRun,
             streamingUrl: statusData.streamingUrl || statusData.streaming_url,
             status: status
           });
         } else if (currentRun) {
           activeRuns.set(runId, { ...currentRun, status: status });
         }
-        
+
         if (status !== "RUNNING" && status !== "PENDING") {
           console.log(`[TinyFish] Run ${runId} status: ${status}`);
         }
-        
+
         if (status === "COMPLETED") {
           broadcastLog({ key: "swarm_complete", label, modeKey: mode === "extract" ? "extract" : "discovery" });
           const safeStatusData = { ...statusData };
@@ -1142,14 +1262,14 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           if (safeStatusData.result) delete safeStatusData.result;
           if (safeStatusData.output) delete safeStatusData.output;
           console.error(`[TinyFish] Run ${runId} FAILED. Data:`, JSON.stringify(safeStatusData));
-          const errorMsg = typeof statusData.error === 'object' && statusData.error !== null 
-            ? (statusData.error.message || JSON.stringify(statusData.error)) 
+          const errorMsg = typeof statusData.error === 'object' && statusData.error !== null
+            ? (statusData.error.message || JSON.stringify(statusData.error))
             : statusData.error;
           throw new Error(errorMsg || "TinyFish run failed");
         }
       } catch (pollError: any) {
-         console.error(`[TinyFish] Error polling status for run ${runId}:`, pollError.message);
-         // Don't throw here, let the loop continue and potentially timeout if it's a transient network error
+        console.error(`[TinyFish] Error polling status for run ${runId}:`, pollError.message);
+        // Don't throw here, let the loop continue and potentially timeout if it's a transient network error
       }
     }
 
@@ -1158,7 +1278,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     if (result) {
       rawResponse = typeof result === 'string' ? result : JSON.stringify(result);
       console.log(`[TinyFish] Received result for ${targetUrl}`);
-      
+
       if (mode === 'extract') {
         if (swarmStopped) return 0;
         try {
@@ -1184,12 +1304,12 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
                   error_message = excluded.error_message,
                   created_at = CURRENT_TIMESTAMP
               `).run(targetUrl, targetUrl, gatekeeper.reason!);
-            } catch (dbErr) {}
+            } catch (dbErr) { }
             throw new Error(gatekeeper.reason);
           }
 
           const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
-          const upsertResult = upsertProject({
+          const upsertResult = await upsertProject({
             title: projectData.title || 'Unknown',
             url: projectData.url || targetUrl,
             description: projectData.description || '',
@@ -1204,11 +1324,11 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
             relevance_score: relevanceScore,
             s_ocean_score: projectData.s_ocean_score ?? 0.75,
           });
-          
+
           try {
             db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(targetUrl);
-          } catch (e) {}
-          
+          } catch (e) { }
+
           projectsFound = upsertResult !== "skipped" ? 1 : 0;
           if (upsertResult !== "skipped") {
             broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
@@ -1262,14 +1382,14 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
                         error_message = excluded.error_message,
                         created_at = CURRENT_TIMESTAMP
                     `).run(targetUrl, projectUrl, gatekeeper.reason!);
-                  } catch (dbErr) {}
+                  } catch (dbErr) { }
                   return 0;
                 }
 
                 if (swarmStopped) return 0;
                 const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
                 broadcastLog({ key: "etl_claude_extract", title: (projectData.title || "?").slice(0, 40) });
-                const upsertResult = upsertProject({
+                const upsertResult = await upsertProject({
                   title: projectData.title || 'Unknown',
                   url: projectData.url || projectUrl,
                   description: projectData.description || '',
@@ -1287,12 +1407,12 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
 
                 try {
                   db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(projectUrl);
-                } catch (e) {}
+                } catch (e) { }
 
                 if (upsertResult !== "skipped") {
                   broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
                 }
-                console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}) [marine=${relevanceScore.toFixed(2)}]${upsertResult === "updated" ? " [dédoublonné]" : ""}: ${projectUrl}`);
+                console.log(`[Extraction] ${i + 1}/${urls.length} URL traitée via (${method}) [marine=${relevanceScore.toFixed(2)}]${upsertResult === "updated" ? " [dédoublonné]" : ""}: ${projectUrl}`);
                 return upsertResult !== "skipped" ? 1 : 0;
               } catch (err: any) {
                 console.error(`[Extraction] Error processing ${projectUrl}:`, err.message);
@@ -1304,7 +1424,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
                       error_message = excluded.error_message,
                       created_at = CURRENT_TIMESTAMP
                   `).run(targetUrl, projectUrl, err.message);
-                } catch (dbErr) {}
+                } catch (dbErr) { }
                 return 0;
               }
             }, () => swarmStopped);
@@ -1332,14 +1452,14 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
   } catch (error: any) {
     console.error(`[TinyFish] Error for ${targetUrl}:`, error.message);
     const duration = Math.round(performance.now() - startTime);
-    
+
     // Auto-retry once with standard profile if it failed early or timed out
     if (retryCount < 1 && !error.message.includes("aborted")) {
       console.log(`[TinyFish] Retrying ${targetUrl} due to error...`);
       if (runId) activeRuns.delete(runId);
       return runTinyFishAgent(targetUrl, proxy, retryCount + 1, mode, taskConfig);
     }
-    
+
     recordTelemetry('tinyfish', targetUrl, 'ERROR', 0, duration, error.message);
     if (runId) activeRuns.delete(runId);
     throw error;
@@ -1437,7 +1557,7 @@ async function startServer() {
   app.get("/api/projects", (req, res) => {
     try {
       const projects = db.prepare("SELECT * FROM projects").all();
-      
+
       const geojson = {
         type: "FeatureCollection",
         features: projects.map((p: any) => ({
@@ -1462,7 +1582,7 @@ async function startServer() {
           },
         })),
       };
-      
+
       res.json(geojson);
     } catch (error) {
       console.error("Error fetching projects:", error);
@@ -1522,6 +1642,109 @@ async function startServer() {
       const idx = logStreamSubscribers.findIndex((s) => s.res === res);
       if (idx >= 0) logStreamSubscribers.splice(idx, 1);
     });
+  });
+
+  app.get("/api/test-project", async (req, res) => {
+    try {
+      // Create a fake project
+      const project = {
+        title: "Coral Reef Restoration Maldives",
+        description: "Project restoring coral reefs in Maldives waters",
+        lat: 3.2,
+        lng: 73.0,
+      };
+
+      // Force insertion even if the swarm is stopped (test mode)
+      const oldSwarmStopped = swarmStopped;
+      console.log("[Test] /api/test-project called (swarmStopped=", swarmStopped, ")");
+      swarmStopped = false;
+      const result = await upsertProject(project);
+      swarmStopped = oldSwarmStopped;
+      console.log("[Test] /api/test-project result=", result, "(swarmStopped restored to", swarmStopped, ")");
+
+      res.setHeader("Content-Type", "application/json");
+      res.send(JSON.stringify({ success: true, project, result, swarmStopped: oldSwarmStopped }));
+    } catch (err: any) {
+      console.error("[Test] /api/test-project error:", err);
+      res.setHeader("Content-Type", "application/json");
+      res.status(500).send(JSON.stringify({ success: false, error: String(err), stack: err?.stack }));
+    }
+  });
+
+  app.get("/api/test-project-2", async (req, res) => {
+    try {
+      // Create a semantically similar project (same location)
+      const project = {
+        title: "Maldives Coral Reef Recovery",
+        description: "Local coral reef recovery program in the Maldives",
+        lat: 3.2,
+        lng: 73.0,
+        url: "https://example.com/project2",
+        funder: "Ocean Protectors",
+        category: "Marine",
+        status: "Active",
+      };
+
+      // Force insertion even if the swarm is stopped (test mode)
+      const oldSwarmStopped = swarmStopped;
+      console.log("[Test] /api/test-project-2 called (swarmStopped=", swarmStopped, ")");
+      swarmStopped = false;
+      const result = await upsertProject(project);
+      swarmStopped = oldSwarmStopped;
+      console.log("[Test] /api/test-project-2 result=", result, "(swarmStopped restored to", swarmStopped, ")");
+
+      // Query nearby records and compute similarity stats for debugging
+      const candidates = db
+        .prepare("SELECT id, title, url, description, lat, lng, title_embedding, description_embedding FROM projects WHERE abs(lat - ?) < 0.01 AND abs(lng - ?) < 0.01")
+        .all(project.lat, project.lng) as Array<{
+          id: number;
+          title: string;
+          url: string;
+          description: string;
+          lat: number;
+          lng: number;
+          title_embedding?: string;
+          description_embedding?: string;
+        }>;
+
+      const { titleEmbedding: queryTitleEmb, descriptionEmbedding: queryDescEmb } = await computeEmbeddingsForProject({
+        title: project.title,
+        description: project.description,
+      });
+
+      const similarities = await Promise.all(
+        candidates.map(async (c) => {
+          let candidateTitleEmb = parseEmbedding(c.title_embedding);
+          let candidateDescEmb = parseEmbedding(c.description_embedding);
+
+          // If embeddings are missing, compute them for debug insight
+          if (!candidateTitleEmb || (c.description && !candidateDescEmb)) {
+            const computed = await computeEmbeddingsForProject({ title: c.title, description: c.description });
+            candidateTitleEmb = candidateTitleEmb || computed.titleEmbedding;
+            candidateDescEmb = candidateDescEmb || computed.descriptionEmbedding;
+          }
+
+          const titleSim = cosineSimilarity(queryTitleEmb, candidateTitleEmb);
+          const hasDesc = queryDescEmb && candidateDescEmb;
+          const descSim = hasDesc ? cosineSimilarity(queryDescEmb, candidateDescEmb) : null;
+          return {
+            id: c.id,
+            url: c.url,
+            title: c.title,
+            description: c.description,
+            titleSim,
+            descSim,
+          };
+        })
+      );
+
+      res.setHeader("Content-Type", "application/json");
+      res.send(JSON.stringify({ success: true, project, result, nearby: similarities }));
+    } catch (err: any) {
+      console.error("[Test] /api/test-project-2 error:", err);
+      res.setHeader("Content-Type", "application/json");
+      res.status(500).send(JSON.stringify({ success: false, error: String(err), stack: err?.stack }));
+    }
   });
 
   app.get("/api/projects/ndjson", (req, res) => {
@@ -1600,7 +1823,7 @@ async function startServer() {
 
   app.post("/api/agent/force-extract", async (req, res) => {
     const { projectUrls, proxy, config } = req.body;
-    
+
     if (!projectUrls || !Array.isArray(projectUrls) || projectUrls.length === 0) {
       return res.status(400).json({ error: "projectUrls array is required" });
     }
@@ -1709,7 +1932,7 @@ async function startServer() {
 
   app.post("/api/agent/start", async (req, res) => {
     const { targetUrl, proxy, mode, config } = req.body;
-    
+
     if (!targetUrl) {
       return res.status(400).json({ error: "targetUrl is required" });
     }
@@ -1735,8 +1958,8 @@ async function startServer() {
   app.get("/api/agent/active-runs", (req, res) => {
     const tinyFishRuns = swarmStopped ? [] : Array.from(activeRuns.entries())
       .filter(([, data]) => !data.aborted && (data.status === "RUNNING" || data.status === "PENDING"))
-      .map(([id, data]) => ({ 
-        id, 
+      .map(([id, data]) => ({
+        id,
         agentLabel: data.agentLabel || "TinyFish",
         streamingUrl: data.streamingUrl,
         status: data.status,
@@ -1836,7 +2059,7 @@ async function startServer() {
 
       const contentType = response.headers.get("content-type");
       if (contentType) res.setHeader("Content-Type", contentType);
-      
+
       // Cache for 24 hours
       res.setHeader("Cache-Control", "public, max-age=86400");
 
@@ -1858,6 +2081,40 @@ async function startServer() {
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
   }
+
+
+  // --- DEDUPLICATION TEST FUNCTION ---
+  async function runDedupTest() {
+    console.log("[TEST] Running deduplication test...");
+
+    const testProjects = [
+      {
+        title: "Coral Reef Restoration Maldives",
+        description: "Project restoring coral reefs in Maldives waters",
+        lat: 3.2,
+        lng: 73.0,
+        url: "https://example.com/project1",
+        funder: "Blue Ocean Foundation",
+        category: "Marine",
+        status: "Active"
+      },
+      {
+        title: "Coral Reef Restoration Maldives",
+        description: "Project restoring coral reefs in Maldives waters",
+        lat: 3.2001,
+        lng: 73.0002,
+        url: "https://example.com/project2",
+        funder: "Ocean Protectors",
+        category: "Marine",
+        status: "Active"
+      }
+    ];
+
+    const savedCount = await saveProjects(testProjects);
+    console.log(`[TEST] Saved ${savedCount} projects (deduplicated)`);
+  }
+  // Uncomment to test manually
+  // await runDedupTest();
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);

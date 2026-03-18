@@ -21,6 +21,10 @@
       ]
     },
     "allowImportingTsExtensions": true,
-    "noEmit": true
-  }
+    "noEmit": true,
+    "typeRoots": ["./node_modules/@types", "./types"]
+  },
+  "exclude": [
+    "node_modules/@tensorflow-models/universal-sentence-encoder/tsconfig.json"
+  ]
 }

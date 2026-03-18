@@ -12,5 +12,7 @@ coverage/
 .env*
 !.env.example
 blue_intelligence.db
+db.sqlite
+database.sqlite
 react-example@0.0.0
 tsx

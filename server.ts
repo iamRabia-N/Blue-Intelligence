@@ -20,7 +20,9 @@ import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import Anthropic from "@anthropic-ai/sdk";
 import { isInland as isInlandGSHHG, distanceToCoastKm } from "./lib/gshhg-landmask";
+import { initializeDomainScoring, getDomainScoringEngine } from "./lib/domainScoring";
 import { embedTexts, cosineSimilarity, serializeEmbedding, parseEmbedding } from "./lib/semanticDedup";
+
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
@@ -633,10 +635,20 @@ async function upsertProject(p: ProjectRow): Promise<"inserted" | "updated" | "s
     description_embedding: serializeEmbedding(descriptionEmbedding),
   });
   const row = db.prepare("SELECT id FROM projects WHERE url = ?").get(projectUrl) as { id: number } | undefined;
+
+  // DOMAIN SCORING: Record project for domain reliability tracking
+  try {
+    const domainEngine = getDomainScoringEngine();
+    domainEngine.recordProject(projectUrl, true);
+  } catch (err) {
+    console.warn(`[DomainScoring] Failed to record domain metrics: ${err}`);
+  }
+
   const feature = {
     type: "Feature",
     geometry: { type: "Point", coordinates: [lng, lat] },
     properties: {
+
       id: row?.id,
       title,
       url: projectUrl,
@@ -1499,7 +1511,10 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  initializeDomainScoring('data/domain-metrics.json');
+
   app.use(express.json());
+
 
   // CORS + frame-ancestors: permet au flux TinyFish (inspector) d'afficher l'app sans blocage
   app.use((_req, res, next) => {
@@ -1811,15 +1826,83 @@ async function startServer() {
     }
   });
 
-  app.get("/api/config/defaults", (_req, res) => {
-    res.json({
-      gatekeeper: {
-        marine_threshold: DEFAULT_GATEKEEPER.marine_threshold,
-        inland_threshold: DEFAULT_GATEKEEPER.inland_threshold,
-        coast_distance_km: DEFAULT_GATEKEEPER.coast_distance_km,
-      },
-    });
+
+  // DOMAIN SCORING ENDPOINTS
+  app.get("/api/domain-scoring/metrics", (req, res) => {
+    try {
+      const engine = getDomainScoringEngine();
+      const minProjects = parseInt(req.query.minProjects as string) || 1;
+      const metrics = engine.getSortedDomains(minProjects);
+      res.json({
+        total: metrics.length,
+        metrics: metrics.map(m => ({
+          domain: m.domain,
+          totalProjects: m.totalProjects,
+          validProjects: m.validProjects,
+          reliabilityScore: parseFloat(m.reliabilityScore.toFixed(4)),
+          lastUpdated: new Date(m.lastUpdated).toISOString(),
+        })),
+      });
+    } catch (error) {
+      console.error("Error fetching domain metrics:", error);
+      res.status(500).json({ error: "Failed to fetch domain metrics" });
+    }
   });
+
+  app.get("/api/domain-scoring/top", (req, res) => {
+    try {
+      const engine = getDomainScoringEngine();
+      const limit = parseInt(req.query.limit as string) || 10;
+      const topDomains = engine.getTopDomains(limit);
+      res.json({
+        limit,
+        domains: topDomains.map(m => ({
+          domain: m.domain,
+          totalProjects: m.totalProjects,
+          validProjects: m.validProjects,
+          reliabilityScore: parseFloat(m.reliabilityScore.toFixed(4)),
+          weightedScore: parseFloat(engine.getWeightedScore(m.domain).toFixed(4)),
+        })),
+      });
+    } catch (error) {
+      console.error("Error fetching top domains:", error);
+      res.status(500).json({ error: "Failed to fetch top domains" });
+    }
+  });
+
+  app.get("/api/domain-scoring/domain/:domain", (req, res) => {
+    try {
+      const engine = getDomainScoringEngine();
+      const { domain } = req.params;
+      const metrics = engine.getDomainMetrics(domain);
+      if (!metrics) {
+        return res.status(404).json({ error: "Domain not found" });
+      }
+      res.json({
+        domain: metrics.domain,
+        totalProjects: metrics.totalProjects,
+        validProjects: metrics.validProjects,
+        reliabilityScore: parseFloat(metrics.reliabilityScore.toFixed(4)),
+        weightedScore: parseFloat(engine.getWeightedScore(domain).toFixed(4)),
+        lastUpdated: new Date(metrics.lastUpdated).toISOString(),
+      });
+    } catch (error) {
+      console.error("Error fetching domain metrics:", error);
+      res.status(500).json({ error: "Failed to fetch domain metrics" });
+    }
+  });
+
+  app.post("/api/domain-scoring/reset", (req, res) => {
+    try {
+      const engine = getDomainScoringEngine();
+      engine.resetMetrics();
+      res.json({ status: "ok", message: "Domain metrics reset" });
+    } catch (error) {
+      console.error("Error resetting domain metrics:", error);
+      res.status(500).json({ error: "Failed to reset domain metrics" });
+    }
+  });
+
 
   app.post("/api/agent/force-extract", async (req, res) => {
     const { projectUrls, proxy, config } = req.body;
@@ -2081,40 +2164,6 @@ async function startServer() {
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
   }
-
-
-  // --- DEDUPLICATION TEST FUNCTION ---
-  async function runDedupTest() {
-    console.log("[TEST] Running deduplication test...");
-
-    const testProjects = [
-      {
-        title: "Coral Reef Restoration Maldives",
-        description: "Project restoring coral reefs in Maldives waters",
-        lat: 3.2,
-        lng: 73.0,
-        url: "https://example.com/project1",
-        funder: "Blue Ocean Foundation",
-        category: "Marine",
-        status: "Active"
-      },
-      {
-        title: "Coral Reef Restoration Maldives",
-        description: "Project restoring coral reefs in Maldives waters",
-        lat: 3.2001,
-        lng: 73.0002,
-        url: "https://example.com/project2",
-        funder: "Ocean Protectors",
-        category: "Marine",
-        status: "Active"
-      }
-    ];
-
-    const savedCount = await saveProjects(testProjects);
-    console.log(`[TEST] Saved ${savedCount} projects (deduplicated)`);
-  }
-  // Uncomment to test manually
-  // await runDedupTest();
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
